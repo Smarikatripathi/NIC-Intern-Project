@@ -1,12 +1,19 @@
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
+
 from django.utils import timezone
 from trekking_and_tour_management_system.bookings.models import Booking
-from rest_framework.generics import ListAPIView
+from rest_framework.generics import ListAPIView, get_object_or_404
 from rest_framework.permissions import IsAuthenticated
+
+from trekking_and_tour_management_system.bookings.utils import calculate_refund_percentage
+from trekking_and_tour_management_system.payments.models import Refund
 from .serializers import BookingHistorySerializer, BookingSerializer, BookingCancelSerializer
 from django.db.models import Q
 from datetime import timedelta
+
+from rest_framework.views import APIView
+
 
 # LIST + CREATE BOOKINGS
 class BookingListCreateAPIView(generics.ListCreateAPIView):
@@ -96,52 +103,47 @@ class BookingHistoryView(ListAPIView):
 
         return qs
     
-class BookingCancelAPIView(generics.UpdateAPIView):
-    permission_classes = [permissions.IsAuthenticated]
-    queryset = Booking.objects.all()
-    lookup_field = "pk"
+class CancelBookingAPIView(APIView):
 
-    def patch(self, request, *args, **kwargs):
-        try:
-            booking = self.get_object()
+    permission_classes = [IsAuthenticated]
 
-            # ownership check
-            if booking.user != request.user:
-                return Response(
-                    {"detail": "Not allowed"},
-                    status=status.HTTP_403_FORBIDDEN
-                )
+    def post(self, request, pk):
 
-            # already cancelled
-            if booking.booking_status == "CANCELLED":
-                return Response(
-                    {"detail": "Already cancelled"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+        booking = get_object_or_404(
+            Booking,
+            id=pk,
+            user=request.user
+        )
 
-            # update booking
-            booking.booking_status = "CANCELLED"
-            booking.cancellation_reason = request.data.get("cancellation_reason", "")
-            booking.cancelled_at = timezone.now()
-            booking.save()
+        #  FIX: use booking_status not status
+        if booking.booking_status == "CANCELLED":
+            return Response({
+                "error": "Booking already cancelled"
+            }, status=400)
 
-            return Response(
-                {
-                    "message": "Booking cancelled successfully",
-                    "booking_id": booking.id,
-                    "status": booking.booking_status
-                },
-                status=status.HTTP_200_OK
-            )
+        refund_percentage = calculate_refund_percentage(
+            booking.trip_start_date   #  FIXED (was package.start_date)
+        )
 
-        except Booking.DoesNotExist:
-            return Response(
-                {"detail": "Booking not found"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+        #  FIX: total_price (not total_amount)
+        refund_amount = (booking.total_price * refund_percentage) / 100
 
-        except Exception as e:
-            return Response(
-                {"detail": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        #  FIX: correct field name
+        booking.booking_status = "CANCELLED"
+        booking.cancelled_at = timezone.now()
+        booking.cancellation_reason = request.data.get("reason", "")
+        booking.save()
+
+        refund = Refund.objects.create(
+            booking=booking,
+            refund_percentage=refund_percentage,
+            refund_amount=refund_amount,
+            payment_method=request.data.get("payment_method"),
+            refund_account=request.data.get("refund_account")
+        )
+
+        return Response({
+            "message": "Booking cancelled successfully",
+            "refund_percentage": refund_percentage,
+            "refund_amount": refund_amount
+        }, status=200)
